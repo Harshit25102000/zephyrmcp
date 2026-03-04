@@ -1,139 +1,325 @@
-from typing import Any, Dict, List, Annotated, Optional
-from mcp.server.fastmcp import Context
-from pydantic import Field
-from src.utils.logging_utils import log_usage
-from src.middleware.auth import extract_zephyr_auth
-from src.client.zephyr_client import ZephyrClient
+from typing import Any, Dict, List, Optional
+from fastmcp import FastMCP
+from fastmcp.server.context import Context
 
-def register_test_tools(mcp, limiter=None):
-    
+
+def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload):
+    """Register all test case management tools and resources."""
+
     # ============================================================
-    # RESOURCES (Read Operations)
+    # RESOURCES — read-only, no state change
     # ============================================================
+
+    @mcp.resource("zephyr://project/{project_key}/tests")
+    async def list_project_tests(project_key: str, ctx: Context) -> str:
+        """
+        [RESOURCE] List all test issues in a given Jira project.
+
+        URI: zephyr://project/{project_key}/tests
+        - project_key: Jira project key (e.g. 'QA', 'AUTO')
+
+        Returns a formatted list of test issues with their key and summary.
+        Use this to discover existing tests before creating duplicates.
+        """
+        check_rate_limit(ctx)
+        log_usage("resource", "list_project_tests", {"projectKey": project_key})
+        username, password, token = extract_zephyr_auth(ctx)
+
+        result = await zephyr_request(
+            "GET", f"{JIRA_API_URL}/search",
+            username, password, token,
+            params={"jql": f"project={project_key} AND issuetype=Test", "fields": "summary,status", "maxResults": 50}
+        )
+        issues = result.get("issues", [])
+        lines = [f"Tests in project {project_key} ({len(issues)} found):"]
+        for i in issues:
+            lines.append(f"- {i['key']}: {i['fields']['summary']}")
+        return "\n".join(lines)
 
     @mcp.resource("zephyr://test/{issue_id}/steps")
-    async def fetch_test_steps(issue_id: str, ctx: Context) -> str:
-        """Fetch all defined steps for a Zephyr test case as a formatted string."""
-        log_usage("resource", "fetch_test_steps", {"issueId": issue_id})
+    async def get_test_steps_resource(issue_id: str, ctx: Context) -> str:
+        """
+        [RESOURCE] Fetch all steps defined for a Zephyr test case.
+
+        URI: zephyr://test/{issue_id}/steps
+        - issue_id: Numeric Jira issue ID (NOT the key like QA-123, use the number)
+
+        Returns a formatted list of test steps with order, action, test data, and expected result.
+        Use this to inspect a test before editing its steps.
+        """
+        check_rate_limit(ctx)
+        log_usage("resource", "get_test_steps", {"issueId": issue_id})
         username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        
-        steps = await client.get_test_steps(issue_id)
-        
-        output = [f"Steps for Test {issue_id}:"]
-        for s in steps:
-            output.append(f"- Step {s.get('orderId')}: {s.get('step')}")
-            if s.get('data'): output.append(f"  Data: {s.get('data')}")
-            if s.get('result'): output.append(f"  Result: {s.get('result')}")
-            
-        return "\n".join(output)
+
+        steps = await zephyr_request("GET", f"{ZAPI_BASE_URL}/teststep/{issue_id}", username, password, token)
+        if not steps:
+            return f"No steps found for test issue ID {issue_id}."
+
+        lines = [f"Steps for test (Issue ID: {issue_id}):"]
+        for s in (steps if isinstance(steps, list) else steps.get("stepBeanCollection", [])):
+            lines.append(f"\nStep {s.get('orderId')}:")
+            lines.append(f"  Action : {s.get('step', '')}")
+            lines.append(f"  Data   : {s.get('data', '')}")
+            lines.append(f"  Result : {s.get('result', '')}")
+        return "\n".join(lines)
 
     # ============================================================
-    # TOOLS (Write Operations)
+    # TOOLS — write operations
     # ============================================================
 
     @mcp.tool()
     async def create_test_case(
         ctx: Context,
-        project_key: Annotated[str, Field(description="The unique key of the Jira project where the test will be created (e.g., 'PROJ')")],
-        summary: Annotated[str, Field(description="Short, descriptive summary of the test case functionality")],
-        description: Annotated[Optional[str], Field(description="Detailed steps, prerequisites, or context for this test", default="")] = "",
+        project_key: str,
+        summary: str,
+        description: str = "",
     ) -> Dict[str, Any]:
-        """Create a new Jira issue of type 'Test'."""
+        """
+        Create a new Jira issue of type 'Test' in the specified project.
+
+        Use this when a new test scenario needs to be tracked in Zephyr.
+        After creating, use insert_test_step to add steps, then add_test_cases_to_cycle to assign to a cycle.
+
+        Input:
+        - project_key (required): Jira project key (e.g. 'QA'). Use get_projects to find valid keys.
+        - summary (required): Short, descriptive title for the test case.
+        - description (optional): Detailed test description including prerequisites or scope.
+
+        Output: { id, key, self } — use 'id' (numeric) for step operations, 'key' for status updates.
+
+        Errors:
+        - 400: Invalid project_key or missing required fields.
+        - 403: Your token lacks permission to create issues in this project.
+        """
+        check_rate_limit(ctx)
         log_usage("tool", "create_test_case", {"projectKey": project_key, "summary": summary})
         username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        return await client.create_test_case(project_key, summary, description)
 
-    @mcp.tool()
-    async def add_test_cases(
-        ctx: Context,
-        cycle_id: Annotated[str, Field(description="The unique ID of the target Zephyr test cycle (e.g. '102')")],
-        project_id: Annotated[int, Field(description="The numeric Jira project ID")],
-        version_id: Annotated[int, Field(description="The numeric Jira version/release ID")],
-        issue_ids: Annotated[List[int], Field(description="A list of numeric Jira issue IDs to be assigned to the cycle")],
-    ) -> Dict[str, Any]:
-        """Bulk assign multiple existing test cases to a specific test cycle."""
-        log_usage("tool", "add_test_cases", {"cycleId": cycle_id, "issue_count": len(issue_ids)})
-        username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        return await client.add_test_cases_to_cycle(cycle_id, project_id, version_id, issue_ids)
-
-    @mcp.tool()
-    async def update_jira_status(
-        ctx: Context,
-        issue_key: Annotated[str, Field(description="The Jira issue key (e.g., 'QA-123')")],
-        transition_id: Annotated[int, Field(description="The specific numeric ID of the workflow transition to perform (e.g., 21 for 'Pass')")],
-    ) -> Dict[str, Any]:
-        """Update the workflow status of a specific Jira issue."""
-        log_usage("tool", "update_jira_status", {"issueKey": issue_key, "transitionId": transition_id})
-        username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        return await client.update_jira_status(issue_key, transition_id)
-
-    @mcp.tool()
-    async def insert_test_steps(
-        ctx: Context,
-        issue_id: Annotated[str, Field(description="The ID of the Jira issue")],
-        step: Annotated[str, Field(description="The action description for this step")],
-        order_id: Annotated[int, Field(description="The position to insert at (1-indexed)")],
-        data: Annotated[Optional[str], Field(description="Optional: Test data for this step", default="")] = "",
-        result: Annotated[Optional[str], Field(description="Optional: Expected result", default="")] = "",
-    ) -> Dict[str, Any]:
-        """Insert a new test step at a specific position within a test."""
-        log_usage("tool", "insert_test_steps", {"issueId": issue_id, "order": order_id})
-        username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        return await client.insert_test_step(issue_id, step, order_id, data, result)
-
-    @mcp.tool()
-    async def update_test_step(
-        ctx: Context,
-        issue_id: Annotated[str, Field(description="The Jira issue ID")],
-        step_id: Annotated[int, Field(description="The unique Zephyr step ID")],
-        step: Annotated[str, Field(description="Updated action description")],
-        data: Annotated[Optional[str], Field(description="Updated test data", default="")] = "",
-        result: Annotated[Optional[str], Field(description="Updated expected result", default="")] = "",
-    ) -> Dict[str, Any]:
-        """Update the content of an existing test step."""
-        log_usage("tool", "update_test_step", {"issueId": issue_id, "stepId": step_id})
-        username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        return await client.update_test_step(issue_id, step_id, step, data, result)
-
-    @mcp.tool()
-    async def delete_test_step(
-        ctx: Context,
-        issue_id: Annotated[str, Field(description="The ID of the Jira issue")],
-        step_id: Annotated[int, Field(description="The Zephyr step ID to remove")],
-    ) -> Dict[str, Any]:
-        """Delete a specific step from a test case."""
-        log_usage("tool", "delete_test_step", {"issueId": issue_id, "stepId": step_id})
-        username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        return await client.delete_test_step(issue_id, step_id)
-
-    @mcp.tool()
-    async def delete_test(
-        ctx: Context,
-        issue_key: Annotated[str, Field(description="The unique Jira key of the test issue to remove permanently (e.g., 'QA-999')")],
-    ) -> Dict[str, Any]:
-        """Permanently delete a Jira issue designated as a 'Test'."""
-        log_usage("tool", "delete_test", {"issueKey": issue_key})
-        username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        return await client.delete_test_case(issue_key)
+        payload = {
+            "fields": {
+                "project": {"key": project_key},
+                "summary": summary,
+                "description": description,
+                "issuetype": {"name": "Test"},
+            }
+        }
+        result = await zephyr_request("POST", f"{JIRA_API_URL}/issue", username, password, token, json_data=payload)
+        return {"id": result.get("id"), "key": result.get("key"), "self": result.get("self")}
 
     @mcp.tool()
     async def create_shared_test(
         ctx: Context,
-        project_key: Annotated[str, Field(description="Jira project key")],
-        summary: Annotated[str, Field(description="Test summary")],
-        description: Annotated[Optional[str], Field(description="Description", default="")] = "",
+        project_key: str,
+        summary: str,
+        description: str = "",
     ) -> Dict[str, Any]:
-        """Create a Test Case intended for shared use (with [SHARED] tag)."""
+        """
+        Create a shared/reusable Test Case (automatically prefixed with [SHARED]).
+
+        Use this for tests intended to be linked from multiple cycles or regression suites.
+        Shared tests are identified by the [SHARED] prefix in their summary.
+
+        Input:
+        - project_key (required): Jira project key.
+        - summary (required): Test summary — [SHARED] prefix is applied automatically.
+        - description (optional): Detailed description.
+
+        Output: { id, key, self }
+        """
+        check_rate_limit(ctx)
         log_usage("tool", "create_shared_test", {"projectKey": project_key})
         username, password, token = extract_zephyr_auth(ctx)
-        client = ZephyrClient(username=username, password=password, token=token)
-        tagged_summary = f"[SHARED] {summary}"
-        return await client.create_test_case(project_key, tagged_summary, description)
+
+        payload = {
+            "fields": {
+                "project": {"key": project_key},
+                "summary": f"[SHARED] {summary}",
+                "description": description,
+                "issuetype": {"name": "Test"},
+            }
+        }
+        result = await zephyr_request("POST", f"{JIRA_API_URL}/issue", username, password, token, json_data=payload)
+        return {"id": result.get("id"), "key": result.get("key"), "self": result.get("self")}
+
+    @mcp.tool()
+    async def delete_test(
+        ctx: Context,
+        issue_key: str,
+    ) -> Dict[str, Any]:
+        """
+        Permanently delete a Jira issue of type 'Test'. This action is irreversible.
+
+        WARNING: This deletes the issue from Jira entirely, removing it from all linked cycles.
+        Only use when a test is truly obsolete.
+
+        Input:
+        - issue_key (required): Jira issue key (e.g. 'QA-123').
+
+        Output: { status: "deleted", issue_key }
+
+        Errors:
+        - 404: Issue not found. Verify the issue_key.
+        - 403: Insufficient permissions to delete this issue.
+        """
+        check_rate_limit(ctx)
+        log_usage("tool", "delete_test", {"issueKey": issue_key})
+        username, password, token = extract_zephyr_auth(ctx)
+        await zephyr_request("DELETE", f"{JIRA_API_URL}/issue/{issue_key}", username, password, token)
+        return {"status": "deleted", "issue_key": issue_key}
+
+    @mcp.tool()
+    async def update_jira_status(
+        ctx: Context,
+        issue_key: str,
+        transition_id: int,
+    ) -> Dict[str, Any]:
+        """
+        Transition a Jira issue to a new workflow status (e.g. In Progress, Done).
+
+        Use this to update the overall status of a test issue in Jira's workflow.
+        This is different from updating the *execution* result in Zephyr (use execute_test for that).
+
+        Input:
+        - issue_key (required): Jira issue key (e.g. 'QA-123').
+        - transition_id (required): Numeric workflow transition ID.
+          Common IDs: 11=To Do, 21=In Progress, 31=Done (these vary by project — fetch from Jira if unsure).
+
+        Output: { status: "transitioned", issue_key, transition_id }
+
+        Errors:
+        - 400: Invalid transition ID for the current issue state.
+        - 404: Issue not found.
+        """
+        check_rate_limit(ctx)
+        log_usage("tool", "update_jira_status", {"issueKey": issue_key, "transitionId": transition_id})
+        username, password, token = extract_zephyr_auth(ctx)
+        await zephyr_request("POST", f"{JIRA_API_URL}/issue/{issue_key}/transitions", username, password, token, json_data={"transition": {"id": transition_id}})
+        return {"status": "transitioned", "issue_key": issue_key, "transition_id": transition_id}
+
+    @mcp.tool()
+    async def add_test_cases_to_cycle(
+        ctx: Context,
+        cycle_id: str,
+        project_id: int,
+        version_id: int,
+        issue_ids: List[int],
+    ) -> Dict[str, Any]:
+        """
+        Bulk assign multiple existing test cases to a specific test cycle.
+
+        Use this instead of individual assignments to minimize API calls (rate limit friendly).
+        All listed issues will be added as executions in the target cycle.
+
+        Input:
+        - cycle_id (required): Zephyr cycle ID as string (e.g. '102'). Use get_cycles to find.
+        - project_id (required): Numeric Jira project ID. Use get_projects to find.
+        - version_id (required): Numeric Jira version ID. Use -1 for unscheduled.
+        - issue_ids (required): List of numeric Jira issue IDs to add. NOT issue keys.
+
+        Output: Confirmation from Zephyr with job status.
+
+        Errors:
+        - 400: Invalid cycle_id, project_id or version_id.
+        - 404: Cycle or issues not found.
+        """
+        check_rate_limit(ctx)
+        log_usage("tool", "add_test_cases_to_cycle", {"cycleId": cycle_id, "count": len(issue_ids)})
+        username, password, token = extract_zephyr_auth(ctx)
+
+        payload = {
+            "issues": issue_ids,
+            "versionId": version_id,
+            "cycleId": cycle_id,
+            "projectId": project_id,
+            "method": "1",
+        }
+        return await zephyr_request("POST", f"{ZAPI_BASE_URL}/execution/addTestsToCycle", username, password, token, json_data=payload)
+
+    @mcp.tool()
+    async def insert_test_step(
+        ctx: Context,
+        issue_id: str,
+        step: str,
+        order_id: int,
+        data: str = "",
+        result: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Insert a new test step at a specific position in a Zephyr test case.
+
+        Use this to build out the step-by-step procedure for a test after creating it.
+        Steps are ordered by order_id (1-indexed). Inserting at an existing position shifts subsequent steps.
+
+        Input:
+        - issue_id (required): Numeric Jira issue ID (not key — use the number from create_test_case).
+        - step (required): The action/instruction for this step (e.g. 'Click Login button').
+        - order_id (required): Position in the step list (1 = first step).
+        - data (optional): Test data or preconditions for this step.
+        - result (optional): Expected outcome after performing this step.
+
+        Output: Created step object from Zephyr.
+        """
+        check_rate_limit(ctx)
+        log_usage("tool", "insert_test_step", {"issueId": issue_id, "order": order_id})
+        username, password, token = extract_zephyr_auth(ctx)
+
+        payload = {"step": step, "data": data, "result": result, "orderId": order_id}
+        return await zephyr_request("POST", f"{ZAPI_BASE_URL}/teststep/{issue_id}", username, password, token, json_data=payload)
+
+    @mcp.tool()
+    async def update_test_step(
+        ctx: Context,
+        issue_id: str,
+        step_id: int,
+        step: str,
+        data: str = "",
+        result: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Update the content of an existing test step.
+
+        Use this to modify the action, test data, or expected result of a step.
+        Use zephyr://test/{issue_id}/steps resource first to get step_id values.
+
+        Input:
+        - issue_id (required): Numeric Jira issue ID.
+        - step_id (required): Numeric Zephyr step ID (from the steps resource).
+        - step (required): Updated action/instruction text.
+        - data (optional): Updated test data.
+        - result (optional): Updated expected result.
+
+        Output: Updated step object.
+        """
+        check_rate_limit(ctx)
+        log_usage("tool", "update_test_step", {"issueId": issue_id, "stepId": step_id})
+        username, password, token = extract_zephyr_auth(ctx)
+
+        payload = {"step": step, "data": data, "result": result}
+        return await zephyr_request("PUT", f"{ZAPI_BASE_URL}/teststep/{issue_id}/{step_id}", username, password, token, json_data=payload)
+
+    @mcp.tool()
+    async def delete_test_step(
+        ctx: Context,
+        issue_id: str,
+        step_id: int,
+    ) -> Dict[str, Any]:
+        """
+        Delete a specific step from a test case. This action is irreversible.
+
+        Use this to remove outdated or incorrect steps.
+        Use zephyr://test/{issue_id}/steps to find the step_id before deleting.
+
+        Input:
+        - issue_id (required): Numeric Jira issue ID.
+        - step_id (required): Numeric Zephyr step ID to remove.
+
+        Output: { status: "deleted", step_id }
+
+        Errors:
+        - 404: Step ID not found for the given issue.
+        """
+        check_rate_limit(ctx)
+        log_usage("tool", "delete_test_step", {"issueId": issue_id, "stepId": step_id})
+        username, password, token = extract_zephyr_auth(ctx)
+        await zephyr_request("DELETE", f"{ZAPI_BASE_URL}/teststep/{issue_id}/{step_id}", username, password, token)
+        return {"status": "deleted", "step_id": step_id}

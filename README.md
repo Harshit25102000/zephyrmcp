@@ -1,123 +1,181 @@
 # Zephyr MCP Server
 
-A robust and modular Model Context Protocol (MCP) server for Zephyr (Jira Data Center). This server provides a comprehensive toolset for QA and release management, allowing LLMs to manage test cases, test steps, cycles, and executions.
+A modular [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for **Zephyr Scale (Jira Data Center)**. Enables LLMs to manage the full QA lifecycle — test cases, steps, cycles, and execution results — via a rate-limited, authenticated HTTP interface.
 
-# Author
-- harshit.singh@nomura.com
+**Author:** harshit.singh@nomura.com
+
+---
 
 ## Features
 
-- **Full QA Lifecycle**: Support for creating tests, managing steps, grouping by cycles, and recording execution results.
-- **UI Parity Tools**: Advanced tools for bulk execution, cycle cloning (Convert to Regression), and shareable execution link generation.
-- **Modular Architecture**: Separate packages for `client` (ZAPI interaction), `middleware` (Auth & Rate Limiting), `tools` (MCP interface), and `utils`.
-- **Dual Authentication**: Supports both **Basic Auth** (Username/Password) and **Token Auth** (Bearer Token) passed via headers.
-- **Advanced Rate Limiting**: Sliding window rate limiter to prevent misuse and ensure stay within API quotas.
-- **Detailed Logging**: 
-    - `logs/access.log`: Audit trail of tool usage (who called what with which parameters).
-    - `logs/server.log`: System events, errors, and debugging information.
-- **HTTP/SSE Transport**: Runs in streamable HTTP mode for easy integration.
+- **Full QA Lifecycle** — Create tests, manage steps, organise cycles, record execution results, attach files.
+- **Resources + Tools** — Read-only operations exposed as MCP Resources (`zephyr://...`); writes as MCP Tools.
+- **Dual Authentication** — Bearer Token (`Authorization: Bearer <token>`) or Basic Auth (`username` / `password` headers).
+- **Sliding Window Rate Limiter** — Configurable per-user request throttling to prevent abuse.
+- **Detailed Logging** — `logs/server.log` for system events, `logs/usage.log` for audit trail.
+- **SSL Verify Off** — Designed for internal Jira Data Center instances (configurable).
+
+---
 
 ## Project Structure
 
 ```text
 zephyr-mcp/
-├── src/
-│   ├── main.py             # Server entry point
-│   ├── config.py           # Configuration variables
-│   ├── client/             # Modular Zephyr/Jira client
-│   │   ├── base.py
-│   │   ├── tests.py
-│   │   ├── cycles.py
-│   │   └── executions.py
-│   ├── tools/              # Modular MCP tool definitions
-│   │   ├── tests.py
-│   │   ├── cycles.py
-│   │   └── executions.py
-│   ├── middleware/         # Auth and Rate Limiting
-│   └── utils/              # Logging and factory utilities
-├── logs/                   # (Auto-created) log files
+├── main.py                  # Entry point (run from project root)
 ├── requirements.txt
-└── README.md
+├── README.md
+├── logs/                    # Auto-created — server.log, usage.log
+└── src/
+    ├── __init__.py
+    ├── config.py            # All configuration variables
+    ├── middleware/
+    │   ├── __init__.py
+    │   └── rate_limit.py    # Sliding window RateLimiter
+    └── tools/
+        ├── __init__.py
+        ├── tests.py         # Test case tools + resources
+        ├── cycles.py        # Cycle management tools + resources
+        └── executions.py    # Execution tools + resources
 ```
+
+---
 
 ## Installation
 
-1. Clone the repository to your local machine.
-2. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+pip install -r requirements.txt
+```
+
+---
 
 ## Configuration
 
-Modify `src/config.py` or set environment variables to configure the server:
+All values are read from environment variables with sensible defaults. Edit `src/config.py` or export variables before starting:
 
-- `JIRA_BASE_URL`: The URL of your Jira Data Center instance.
-- `PORT`: The port the MCP server will listen on (default: 9002).
-- `RATE_LIMIT_COUNT`: Number of requests allowed per window.
-- `RATE_LIMIT_WINDOW_SECONDS`: The timeframe for the rate limit window.
-- `MAX_PROJECTS_PER_QUERY` / `MAX_TESTS_PER_BULK`: Safety guardrails for bulk operations.
+| Variable | Default | Description |
+|---|---|---|
+| `JIRA_BASE_URL` | `http://stg-jira.nomura.com` | Jira Data Center base URL |
+| `PORT` | `5000` | Port for the MCP HTTP server |
+| `JIRA_TIMEOUT` | `30` | HTTP request timeout in seconds |
+| `JIRA_VERIFY_SSL` | `False` | Set to `True` to enable SSL verification |
+| `RATE_LIMIT_COUNT` | `5` | Max requests per window per user |
+| `RATE_LIMIT_WINDOW_SECONDS` | `10` | Rate limit window duration in seconds |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+
+---
 
 ## Running the Server
 
-Start the MCP server in HTTP mode:
+Start from the **project root** (not inside `src/`):
 
 ```bash
-python src/main.py
+python main.py
 ```
 
-The server will start listening on the configured port. By default, it uses the `http` transport for streamable communication.
+Or with environment variable overrides:
 
-## Tool Overview
+```bash
+JIRA_BASE_URL=https://jira.yourcompany.com PORT=8080 python main.py
+```
 
-### 🧪 Test Case Management (`src/tools/tests.py`)
-- **`create_test_case`**: Initializes a new Jira issue of type 'Test'. (Req: `project_key`, `summary`).
-- **`add_test_cases`**: Bulk assign existing tests to a cycle. (Req: `cycle_id`, `project_id`, `version_id`, `issue_ids`).
-- **`update_jira_status`**: Transitions a test case through its Jira workflow. (Req: `issue_key`, `transition_id`).
-- **`create_shared_test`**: Specialized creation of reusable test cases with `[SHARED]` prefix.
-- **`fetch_test_steps`**: Retrieves the detailed ACTION/DATA/RESULT sequence for any test ID.
-- **`insert_test_steps`**: Inserts a new step at a precise position within a test.
-- **`update_test_step`**: Modifies the action or outcome of an existing step ID.
-- **`delete_test_step`**: Removes a specific step from a test case.
-- **`delete_test`**: Permanently deletes the Jira issue (test case) from the server.
-
-### 🚲 Cycle & Release Management (`src/tools/cycles.py`)
-- **`create_cycle`**: Create a test cycle with full metadata (Build, Env, Dates). (Req: `name`, `project_id`, `version_id`).
-- **`clone_cycle`**: Efficiently copies an existing cycle's test associations into a new one.
-- **`add_folder`**: Creates a logical folder within a cycle for granular grouping.
-- **`edit_cycle`**: Updates attributes (name, environment, build) of an existing cycle ID.
-- **`delete_cycle`**: Destructive operation to remove a cycle and all its execution data.
-- **`fetch_cycles_from_version`**: Lists all active cycles for a specific release version ID.
-- **`fetch_test_cases_from_cycle_with_stats`**: **Analytical tool** providing a Pass/Fail breakdown for every execution in a cycle.
-- **`get_issue_statuses`**: Project-wide distribution of issue statuses for QA visibility.
-- **`list_qa_projects`**: Lists all projects available for Zephyr integration.
-
-### ✅ Execution & Validation (`src/tools/executions.py`)
-- **`execute_test`**: Principal tool for recording Pass/Fail results for a test in a cycle.
-- **`bulk_execute_tests`**: Simultaneously updates statuses for multiple executions.
-- **`fetch_step_execution_details`**: Retrieves granular, step-by-step results for a validation run.
-- **`update_step_status`**: Precisely records success/failure for an individual test step.
-- **`add_attachment_to_execution`**: Attaches diagnostic files (logs/images) to a general execution record.
-- **`add_attachment_to_step_result`**: Attaches proof files specifically to a failed test step.
-- **`get_execution_link`**: Generates a shareable URL to the interactive Zephyr execution page in Jira.
-- **`assign_test_to_cycle`**: Starts a validation run for a test by assigning it to a cycle.
-- **`get_executions_by_cycle`**: Comprehensive list of all recorded results for a specific cycle ID.
+---
 
 ## Authentication
 
-The Zephyr MCP server supports two ways to authenticate:
+Every tool call must include credentials in the HTTP request headers.
 
-1.  **Bearer Token**:
-    - Header: `Authorization: Bearer <your_bearer_token>`
-2.  **Basic Auth (Dedicated Headers)**:
-    - Header: `username: <your_jira_username>`
-    - Header: `password: <your_jira_password_or_api_token>`
+**Option 1 — Bearer Token:**
+```
+Authorization: Bearer <your_jira_token>
+```
+
+**Option 2 — Basic Auth (dedicated headers):**
+```
+username: <jira_username>
+password: <jira_password>
+```
 
 > [!IMPORTANT]
-> If no credentials are provided through either of these methods, the server will return an error: `Credentials not provided`.
+> If no credentials are provided, the server returns: `Credentials not provided`.
+> Do **not** retry without correcting your headers.
+
+---
+
+## Rate Limiting
+
+This server uses a **sliding window rate limiter** per user/token:
+
+- Default: **5 requests per 10 seconds**
+- Configurable via `RATE_LIMIT_COUNT` and `RATE_LIMIT_WINDOW_SECONDS`
+- If exceeded, response: `Rate limit exceeded: max 5 requests per 10 seconds. Please wait 10 seconds.`
+- **Use bulk tools** (`add_test_cases_to_cycle`, `bulk_execute_tests`) to minimise calls.
+
+---
+
+## MCP Resources (Read-Only)
+
+Resources do not change state. Use them for discovery before invoking write tools.
+
+| Resource URI | Description |
+|---|---|
+| `zephyr://system/projects` | List all accessible Jira projects |
+| `zephyr://project/{project_key}/tests` | List test issues in a project |
+| `zephyr://test/{issue_id}/steps` | View all steps for a test |
+| `zephyr://version/{project_id}/{version_id}/cycles` | List cycles in a version |
+| `zephyr://cycle/{cycle_id}/project/{project_id}/executions` | List executions with status |
+| `zephyr://execution/{execution_id}/steps` | View step-level results |
+
+---
+
+## MCP Tools (Write Operations)
+
+### 🧪 Test Case Management
+| Tool | Description |
+|---|---|
+| `health_check` | Verify server is running and see config |
+| `create_test_case` | Create a new Jira Test issue |
+| `create_shared_test` | Create a reusable test (auto-prefixed `[SHARED]`) |
+| `delete_test` | Permanently delete a Test issue |
+| `update_jira_status` | Transition issue workflow status |
+| `add_test_cases_to_cycle` | Bulk assign tests to a cycle |
+| `insert_test_step` | Add a step at a specific position |
+| `update_test_step` | Edit an existing step |
+| `delete_test_step` | Remove a step |
+| `get_test_steps` | Fetch steps as structured data |
+
+### 🔄 Cycle Management
+| Tool | Description |
+|---|---|
+| `get_projects` | List projects as structured data |
+| `get_cycles` | List cycles as structured data |
+| `fetch_cycle_stats` | Pass/Fail/WIP breakdown for a cycle |
+| `get_issue_statuses` | Workflow transitions for a project |
+| `create_cycle` | Create a new test cycle |
+| `clone_cycle` | Copy an existing cycle |
+| `edit_cycle` | Update cycle metadata |
+| `delete_cycle` | Permanently remove a cycle |
+| `add_folder` | Create a grouping folder within a cycle |
+
+### ✅ Execution & Results
+| Tool | Description |
+|---|---|
+| `get_executions_by_cycle` | List executions as structured data |
+| `get_step_execution_details` | List step results as structured data |
+| `get_execution_link` | Generate a browser link to an execution |
+| `execute_test` | Record Pass/Fail/WIP/Blocked for an execution |
+| `bulk_execute_tests` | Update multiple executions at once |
+| `update_step_status` | Set Pass/Fail on a specific step result |
+| `assign_test_to_cycle` | Assign a single test to a cycle |
+| `add_attachment_to_execution` | Attach a file to an execution |
+| `add_attachment_to_step_result` | Attach a file to a step result |
+
+---
 
 ## Logging
 
-The server automatically creates a `logs/` directory:
-- Every tool usage is logged in JSON format to `logs/access.log`.
-- System-level logs are maintained in `logs/server.log`.
+| File | Content |
+|---|---|
+| `logs/server.log` | Server startup, errors, system events |
+| `logs/usage.log` | Audit trail: timestamp, tool/resource name, parameters |
+
+Log format: `2026-03-04T15:30:00 | tool=execute_test | params={'executionId': 123}`

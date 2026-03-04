@@ -1,14 +1,14 @@
-import os
+﻿import os
 from typing import Any, Dict, List, Optional
 from fastmcp import FastMCP
 from fastmcp.server.context import Context
 
 
-def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload):
+def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload, filter_fields, check_tool_limit, TOOL_MAX_ITEMS, BULK_MAX_ITEMS, MAX_RESULTS):
     """Register all test execution management tools and resources."""
 
     # ============================================================
-    # RESOURCES — read-only
+    # RESOURCES â€” read-only
     # ============================================================
 
     @mcp.resource("zephyr://cycle/{cycle_id}/project/{project_id}/executions")
@@ -30,7 +30,7 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         result = await zephyr_request(
             "GET", f"{ZAPI_BASE_URL}/execution",
             username, password, token,
-            params={"cycleId": cycle_id, "projectId": project_id}
+            params={"cycleId": cycle_id, "projectId": project_id, "maxRecords": MAX_RESULTS}
         )
 
         executions = result.get("executions", [])
@@ -68,7 +68,7 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         return "\n".join(lines)
 
     # ============================================================
-    # TOOLS — write operations
+    # TOOLS â€” write operations
     # ============================================================
 
     @mcp.tool()
@@ -76,6 +76,7 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         ctx: Context,
         cycle_id: int,
         project_id: int,
+        fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Fetch all test executions and their current results for a cycle (as structured data).
@@ -84,25 +85,32 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         For a human-readable summary, use zephyr://cycle/{cycle_id}/project/{project_id}/executions resource.
 
         Input:
-        - cycle_id (required): Numeric Zephyr cycle ID. Use get_cycles to find.
+        - cycle_id (required): Numeric Zephyr cycle ID.
         - project_id (required): Numeric Jira project ID.
+        - fields (optional): List of execution keys to include per item.
+          Available keys: id, issueKey, issueId, executionStatus, executionStatusName,
+                          comment, cycleName, versionName, assignee, label
+          Example: ["id", "issueKey", "executionStatus"]
 
-        Output: List of execution objects with id, issueKey, executionStatus fields.
+        Output: List of execution objects (filtered if fields specified).
         Status codes: -1=UNEXECUTED, 1=PASS, 2=FAIL, 3=WIP, 4=BLOCKED
 
         Errors:
         - 404: Cycle or project not found.
         """
         check_rate_limit(ctx)
-        log_usage("tool", "get_executions_by_cycle", {"cycleId": cycle_id, "projectId": project_id})
+        log_usage("tool", "get_executions_by_cycle", {"cycleId": cycle_id, "projectId": project_id, "fields": fields})
         username, password, token = extract_zephyr_auth(ctx)
 
         result = await zephyr_request(
             "GET", f"{ZAPI_BASE_URL}/execution",
             username, password, token,
-            params={"cycleId": cycle_id, "projectId": project_id}
+            params={"cycleId": cycle_id, "projectId": project_id, "maxRecords": MAX_RESULTS}
         )
-        return result.get("executions", [])
+        executions = result.get("executions", [])
+        # Slice to TOOL_MAX_ITEMS to guard against oversized responses
+        executions = executions[:TOOL_MAX_ITEMS]
+        return filter_fields(executions, fields)
 
     @mcp.tool()
     async def get_execution_link(
@@ -121,7 +129,7 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         """
         check_rate_limit(ctx)
         log_usage("tool", "get_execution_link", {"executionId": execution_id})
-        extract_zephyr_auth(ctx)  # validate credentials only
+        extract_zephyr_auth(ctx)
         base = JIRA_API_URL.replace("/rest/api/2", "")
         return f"{base}/secure/Tests.jspa#/design?executionId={execution_id}"
 
@@ -131,24 +139,25 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         execution_id: int,
         status_id: int,
         comment: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Record the final testing outcome for a specific test execution.
 
-        Use this after running a test manually or via automation to record the result.
         First call get_executions_by_cycle to find the execution_id for the test you ran.
 
         Input:
         - execution_id (required): Numeric Zephyr execution ID.
         - status_id (required): Execution result:
-            1 = PASS     — Test passed all assertions
-            2 = FAIL     — Test failed one or more checks
-            3 = WIP      — Test is in progress (not finished)
-            4 = BLOCKED  — Cannot run due to a blocking issue
-           -1 = UNEXECUTED — Reset to unexecuted state
+            1 = PASS     â€” Test passed all assertions
+            2 = FAIL     â€” Test failed one or more checks
+            3 = WIP      â€” Test is in progress (not finished)
+            4 = BLOCKED  â€” Cannot run due to a blocking issue
+           -1 = UNEXECUTED â€” Reset to unexecuted state
         - comment (optional): Brief explanation of result (especially useful for FAIL/BLOCKED).
+        - fields (optional): List of response keys to include (e.g. ["id", "status"]).
 
-        Output: Updated execution object from Zephyr.
+        Output: Updated execution object (filtered if fields specified).
 
         Errors:
         - 400: Invalid status_id value.
@@ -159,7 +168,8 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         username, password, token = extract_zephyr_auth(ctx)
 
         payload = {"status": str(status_id), "comment": comment}
-        return await zephyr_request("PUT", f"{ZAPI_BASE_URL}/execution/{execution_id}/execute", username, password, token, json_data=payload)
+        result = await zephyr_request("PUT", f"{ZAPI_BASE_URL}/execution/{execution_id}/execute", username, password, token, json_data=payload)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def bulk_execute_tests(
@@ -167,6 +177,7 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         execution_ids: List[int],
         status_id: int,
         comment: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Bulk update multiple test executions with a single result status.
@@ -174,47 +185,54 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         RATE LIMIT FRIENDLY: Use this instead of calling execute_test in a loop.
         This counts as ONE API call regardless of how many executions you update.
 
-        Typical use: After a regression run, mark all passed tests as PASS in one call.
-
         Input:
         - execution_ids (required): List of numeric Zephyr execution IDs to update.
-        - status_id (required): Target status for ALL executions: 1=PASS, 2=FAIL, 3=WIP, 4=BLOCKED, -1=UNEXECUTED
+          **Limit**: maximum {BULK_MAX_ITEMS} execution IDs per call. Split larger batches.
+        - status_id (required): 1=PASS, 2=FAIL, 3=WIP, 4=BLOCKED, -1=UNEXECUTED
         - comment (optional): Comment applied to all updated executions.
+        - fields (optional): List of response keys to include.
 
-        Output: Bulk update confirmation from Zephyr.
+        Output: Bulk update confirmation (filtered if fields specified).
 
         Errors:
         - 400: Invalid status_id or malformed execution_ids list.
+        - Tool limit: Exceeding {BULK_MAX_ITEMS} execution_ids in one call will be rejected.
         """
         check_rate_limit(ctx)
+        check_tool_limit(execution_ids, "execution_ids", limit=BULK_MAX_ITEMS)
         log_usage("tool", "bulk_execute_tests", {"count": len(execution_ids), "statusId": status_id})
         username, password, token = extract_zephyr_auth(ctx)
 
         payload = {"executions": execution_ids, "status": str(status_id), "comment": comment}
-        return await zephyr_request("PUT", f"{ZAPI_BASE_URL}/execution/updateBulkStatus", username, password, token, json_data=payload)
+        result = await zephyr_request("PUT", f"{ZAPI_BASE_URL}/execution/updateBulkStatus", username, password, token, json_data=payload)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def get_step_execution_details(
         ctx: Context,
         execution_id: int,
+        fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Fetch granular step-by-step execution results for a test run (as structured data).
 
-        Use this when you need to programmatically process or report on step-level results.
-        For a human-readable view, use zephyr://execution/{execution_id}/steps resource.
         Use step result IDs from this output with update_step_status.
+        For a human-readable view, use zephyr://execution/{execution_id}/steps resource.
 
         Input:
         - execution_id (required): Numeric Zephyr execution ID.
+        - fields (optional): List of step result keys to include per item.
+          Available keys: id, orderId, status, step, data, result, comment, executionId
+          Example: ["id", "orderId", "status", "comment"]
 
-        Output: List of step result objects with id, orderId, status, step, comment.
+        Output: List of step result objects (filtered if fields specified).
         Status: -1=UNEXECUTED, 1=PASS, 2=FAIL, 3=WIP, 4=BLOCKED
         """
         check_rate_limit(ctx)
-        log_usage("tool", "get_step_execution_details", {"executionId": execution_id})
+        log_usage("tool", "get_step_execution_details", {"executionId": execution_id, "fields": fields})
         username, password, token = extract_zephyr_auth(ctx)
-        return await zephyr_request("GET", f"{ZAPI_BASE_URL}/stepResult?executionId={execution_id}", username, password, token)
+        result = await zephyr_request("GET", f"{ZAPI_BASE_URL}/stepResult?executionId={execution_id}", username, password, token)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def update_step_status(
@@ -222,19 +240,20 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         step_result_id: int,
         status_id: int,
         comment: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Update the pass/fail result of a specific step within a running test execution.
 
-        Use this for granular step-level reporting when individual steps need different statuses.
         Get step_result_id from get_step_execution_details or the zephyr://execution/{id}/steps resource.
 
         Input:
-        - step_result_id (required): Numeric Zephyr step result ID (NOT the step definition ID).
-        - status_id (required): Step result: 1=PASS, 2=FAIL, 3=WIP, 4=BLOCKED, -1=UNEXECUTED
+        - step_result_id (required): Numeric Zephyr step result ID (NOT step definition ID).
+        - status_id (required): 1=PASS, 2=FAIL, 3=WIP, 4=BLOCKED, -1=UNEXECUTED
         - comment (optional): Notes on why this step passed or failed.
+        - fields (optional): List of response keys to include.
 
-        Output: Updated step result object.
+        Output: Updated step result object (filtered if fields specified).
 
         Errors:
         - 404: Step result ID not found.
@@ -244,7 +263,8 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         username, password, token = extract_zephyr_auth(ctx)
 
         payload = {"status": str(status_id), "comment": comment}
-        return await zephyr_request("PUT", f"{ZAPI_BASE_URL}/stepResult/{step_result_id}", username, password, token, json_data=payload)
+        result = await zephyr_request("PUT", f"{ZAPI_BASE_URL}/stepResult/{step_result_id}", username, password, token, json_data=payload)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def assign_test_to_cycle(
@@ -253,20 +273,21 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         cycle_id: int,
         project_id: int,
         version_id: int,
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Assign a single test to a cycle by creating an execution record.
 
         Use add_test_cases_to_cycle for bulk assignment (more rate-limit friendly).
-        This tool is for assigning one test at a time.
 
         Input:
         - issue_id (required): Numeric Jira issue ID (the number, not 'QA-123').
         - cycle_id (required): Numeric Zephyr cycle ID.
         - project_id (required): Numeric Jira project ID.
         - version_id (required): Numeric Jira version ID.
+        - fields (optional): List of response keys to include (e.g. ["id", "issueKey"]).
 
-        Output: Created execution object with execution_id for future status updates.
+        Output: Created execution object (filtered if fields specified).
 
         Errors:
         - 400: Invalid IDs or test already exists in this cycle.
@@ -277,7 +298,8 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         username, password, token = extract_zephyr_auth(ctx)
 
         payload = {"issueId": issue_id, "cycleId": cycle_id, "projectId": project_id, "versionId": version_id}
-        return await zephyr_request("POST", f"{ZAPI_BASE_URL}/execution", username, password, token, json_data=payload)
+        result = await zephyr_request("POST", f"{ZAPI_BASE_URL}/execution", username, password, token, json_data=payload)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def add_attachment_to_execution(
@@ -288,13 +310,11 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
         """
         Attach a file (screenshot, log, report) to a test execution result.
 
-        Use this to provide evidence of test results directly in Zephyr.
         The file must be accessible on the local filesystem where the server is running.
 
         Input:
         - execution_id (required): Numeric Zephyr execution ID.
-        - file_path (required): Absolute local file path to the file to attach.
-          Example: 'C:/test_results/screenshot.png'
+        - file_path (required): Absolute local file path (e.g. 'C:/test_results/screenshot.png').
 
         Output: Attachment confirmation from Zephyr.
 
@@ -310,7 +330,7 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
             )
 
         check_rate_limit(ctx)
-        log_usage("tool", "add_attachment_to_execution", {"executionId": execution_id, "file": file_path})
+        log_usage("tool", "add_attachment_to_execution", {"executionId": execution_id})
         username, password, token = extract_zephyr_auth(ctx)
 
         with open(file_path, "rb") as f:
@@ -335,7 +355,7 @@ def register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extrac
 
         Input:
         - step_result_id (required): Numeric Zephyr step result ID.
-        - file_path (required): Absolute local file path to the file to attach.
+        - file_path (required): Absolute local file path.
 
         Output: Attachment confirmation from Zephyr.
 

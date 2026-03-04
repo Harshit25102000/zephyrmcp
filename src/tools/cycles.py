@@ -1,13 +1,13 @@
-from typing import Any, Dict, List, Optional
+﻿from typing import Any, Dict, List, Optional
 from fastmcp import FastMCP
 from fastmcp.server.context import Context
 
 
-def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request):
+def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, filter_fields, check_tool_limit, TOOL_MAX_ITEMS, BULK_MAX_ITEMS, MAX_RESULTS):
     """Register all test cycle management tools and resources."""
 
     # ============================================================
-    # RESOURCES — read-only
+    # RESOURCES â€” read-only
     # ============================================================
 
     @mcp.resource("zephyr://system/projects")
@@ -59,33 +59,43 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         return "\n".join(lines)
 
     # ============================================================
-    # TOOLS — write operations
+    # TOOLS â€” write/read operations
     # ============================================================
 
     @mcp.tool()
-    async def get_projects(ctx: Context) -> List[Dict[str, Any]]:
+    async def get_projects(
+        ctx: Context,
+        fields: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         List all Jira projects available to the authenticated user (as structured data).
 
-        Use this when you need machine-readable project data (id, key, name).
+        Use this when you need machine-readable project data.
         For a human-readable summary, use the zephyr://system/projects resource instead.
 
-        Output: List of { id, key, name }
+        Input:
+        - fields (optional): List of project keys to include per item.
+          Available keys: id, key, name, description, projectTypeKey, lead, url, avatarUrls
+          Example: ["id", "key", "name"]
+
+        Output: List of project objects (filtered if fields specified).
 
         Errors:
         - 401/403: Authentication or permission failure.
         """
         check_rate_limit(ctx)
-        log_usage("tool", "get_projects", {})
+        log_usage("tool", "get_projects", {"fields": fields})
         username, password, token = extract_zephyr_auth(ctx)
-        projects = await zephyr_request("GET", f"{JIRA_API_URL}/project", username, password, token)
-        return [{"id": p["id"], "key": p["key"], "name": p["name"]} for p in projects]
+        projects = await zephyr_request("GET", f"{JIRA_API_URL}/project", username, password, token, params={"maxResults": MAX_RESULTS})
+        result = [{"id": p["id"], "key": p["key"], "name": p["name"], **{k: p.get(k) for k in (fields or []) if k not in ("id", "key", "name")}} for p in projects[:MAX_RESULTS]]
+        return filter_fields(result, fields) if fields else result
 
     @mcp.tool()
     async def get_cycles(
         ctx: Context,
         project_id: int,
         version_id: int,
+        fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve all test cycles for a specific project and release version (as structured data).
@@ -96,14 +106,17 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         Input:
         - project_id (required): Numeric Jira project ID. Use get_projects to find.
         - version_id (required): Numeric Jira version/fixVersion ID. Use -1 for unscheduled.
+        - fields (optional): List of cycle keys to return per cycle.
+          Available keys: id, name, description, build, environment, startDate, endDate, totalExecutions
+          Example: ["id", "name", "build"] â€” returns only those three fields per cycle.
 
-        Output: List of cycle objects, each with id, name, build, environment, description fields.
+        Output: List of cycle objects (filtered if fields specified).
 
         Errors:
         - 404: Project or version not found.
         """
         check_rate_limit(ctx)
-        log_usage("tool", "get_cycles", {"projectId": project_id, "versionId": version_id})
+        log_usage("tool", "get_cycles", {"projectId": project_id, "versionId": version_id, "fields": fields})
         username, password, token = extract_zephyr_auth(ctx)
 
         result = await zephyr_request(
@@ -116,29 +129,30 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
             if key != "recordsCount" and isinstance(val, dict):
                 val["id"] = key
                 cycles.append(val)
-        return cycles
+        # Cap results to TOOL_MAX_ITEMS
+        cycles = cycles[:TOOL_MAX_ITEMS]
+        return filter_fields(cycles, fields)
 
     @mcp.tool()
     async def fetch_cycle_stats(
         ctx: Context,
         cycle_id: int,
         project_id: int,
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Fetch test execution statistics for a cycle: Pass/Fail/WIP/Blocked/Unexecuted counts.
 
         Use this for a cycle-level release summary or to identify failing areas.
-        Counts are based on the current execution statuses in the cycle.
 
         Input:
         - cycle_id (required): Numeric Zephyr cycle ID. Use get_cycles to find.
         - project_id (required): Numeric Jira project ID.
+        - fields (optional): List of keys to include in response.
+          Available keys: cycleId, totalExecutions, statistics
+          Example: ["statistics"] â€” returns only the stats breakdown.
 
-        Output:
-        {
-          cycleId, totalExecutions,
-          statistics: { PASS, FAIL, WIP, BLOCKED, UNEXECUTED }
-        }
+        Output: { cycleId, totalExecutions, statistics: { PASS, FAIL, WIP, BLOCKED, UNEXECUTED } }
 
         Errors:
         - 404: Cycle not found for the given project.
@@ -162,12 +176,14 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
             elif status == "4": stats["BLOCKED"] += 1
             else: stats["UNEXECUTED"] += 1
 
-        return {"cycleId": cycle_id, "totalExecutions": sum(stats.values()), "statistics": stats}
+        response = {"cycleId": cycle_id, "totalExecutions": sum(stats.values()), "statistics": stats}
+        return filter_fields(response, fields)
 
     @mcp.tool()
     async def get_issue_statuses(
         ctx: Context,
         project_id: int,
+        fields: Optional[List[str]] = None,
     ) -> Any:
         """
         Fetch the workflow status categories and transitions available for a Jira project.
@@ -176,6 +192,7 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
 
         Input:
         - project_id (required): Numeric Jira project ID.
+        - fields (optional): List of keys to include per status item.
 
         Output: Jira status category and issue type metadata.
 
@@ -185,7 +202,8 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         check_rate_limit(ctx)
         log_usage("tool", "get_issue_statuses", {"projectId": project_id})
         username, password, token = extract_zephyr_auth(ctx)
-        return await zephyr_request("GET", f"{JIRA_API_URL}/project/{project_id}/statuses", username, password, token)
+        result = await zephyr_request("GET", f"{JIRA_API_URL}/project/{project_id}/statuses", username, password, token)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def create_cycle(
@@ -199,6 +217,7 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         description: str = "",
         start_date: str = "",
         end_date: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Create a new Test Cycle in Zephyr for a specific project and version.
@@ -216,8 +235,9 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         - description (optional): Purpose and scope of this cycle.
         - start_date (optional): Format as 'DD/Mon/YY' (e.g. '03/Mar/26').
         - end_date (optional): Format as 'DD/Mon/YY'.
+        - fields (optional): List of response keys to include (e.g. ["id", "name"]).
 
-        Output: { id, name } of the created cycle.
+        Output: Created cycle object (filtered if fields specified).
 
         Errors:
         - 400: Invalid project_id, version_id, or date format.
@@ -234,7 +254,8 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         if end_date: payload["endDate"] = end_date
         if cloned_cycle_id: payload["clonedCycleId"] = cloned_cycle_id
 
-        return await zephyr_request("POST", f"{ZAPI_BASE_URL}/cycle", username, password, token, json_data=payload)
+        result = await zephyr_request("POST", f"{ZAPI_BASE_URL}/cycle", username, password, token, json_data=payload)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def clone_cycle(
@@ -246,12 +267,12 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         build: str = "",
         environment: str = "QA",
         description: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Create a full copy of an existing test cycle, including all linked tests.
 
         Use this to set up regression cycles by cloning functional cycles.
-        Unlike create_cycle with cloned_cycle_id, this is the explicit clone action.
 
         Input:
         - name (required): Name for the new cloned cycle.
@@ -259,8 +280,9 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         - version_id (required): Numeric Jira version ID.
         - cloned_cycle_id (required): ID of the source cycle to clone from.
         - build, environment, description (optional): Override these from the source.
+        - fields (optional): List of response keys to include.
 
-        Output: Created cycle object from Zephyr.
+        Output: Created cycle object from Zephyr (filtered if fields specified).
         """
         check_rate_limit(ctx)
         log_usage("tool", "clone_cycle", {"clonedFrom": cloned_cycle_id, "newName": name})
@@ -271,7 +293,8 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
             "clonedCycleId": cloned_cycle_id, "build": build,
             "environment": environment, "description": description,
         }
-        return await zephyr_request("POST", f"{ZAPI_BASE_URL}/cycle", username, password, token, json_data=payload)
+        result = await zephyr_request("POST", f"{ZAPI_BASE_URL}/cycle", username, password, token, json_data=payload)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def edit_cycle(
@@ -281,18 +304,19 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         build: Optional[str] = None,
         environment: Optional[str] = None,
         description: Optional[str] = None,
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Update metadata of an existing test cycle. Only provided fields are updated.
 
-        Use this to rename a cycle, update its build tag, or change its description.
         Does NOT affect linked tests or execution statuses.
 
         Input:
         - cycle_id (required): Numeric Zephyr cycle ID.
-        - name, build, environment, description (optional): Fields to update. Omit to keep current value.
+        - name, build, environment, description (optional): Fields to update.
+        - fields (optional): List of response keys to return (e.g. ["id", "name"]).
 
-        Output: Updated cycle object.
+        Output: Updated cycle object (filtered if fields specified).
 
         Errors:
         - 404: Cycle not found.
@@ -307,7 +331,8 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         if environment is not None: payload["environment"] = environment
         if description is not None: payload["description"] = description
 
-        return await zephyr_request("PUT", f"{ZAPI_BASE_URL}/cycle/{cycle_id}", username, password, token, json_data=payload)
+        result = await zephyr_request("PUT", f"{ZAPI_BASE_URL}/cycle/{cycle_id}", username, password, token, json_data=payload)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def delete_cycle(
@@ -318,7 +343,6 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         Permanently delete a test cycle and all its associated execution records.
 
         WARNING: This is irreversible. All execution history for this cycle will be lost.
-        Only delete cycles that are truly obsolete.
 
         Input:
         - cycle_id (required): Numeric Zephyr cycle ID to delete.
@@ -342,24 +366,24 @@ def register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_ze
         parent_cycle_id: int,
         project_id: int,
         version_id: int,
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Create a logical folder inside a test cycle to organize test groups.
-
-        Use folders to group related tests within a cycle (e.g. by feature area or severity).
-        After creating a folder, tests can be assigned to it with add_test_cases_to_cycle.
 
         Input:
         - name (required): Folder display name (e.g. 'Login Tests', 'Smoke Suite').
         - parent_cycle_id (required): Numeric ID of the parent cycle.
         - project_id (required): Numeric Jira project ID.
         - version_id (required): Numeric Jira version ID.
+        - fields (optional): List of response keys to include.
 
-        Output: Created folder object from Zephyr.
+        Output: Created folder object from Zephyr (filtered if fields specified).
         """
         check_rate_limit(ctx)
         log_usage("tool", "add_folder", {"name": name, "cycleId": parent_cycle_id})
         username, password, token = extract_zephyr_auth(ctx)
 
         payload = {"name": name, "cycleId": parent_cycle_id, "projectId": project_id, "versionId": version_id}
-        return await zephyr_request("POST", f"{ZAPI_BASE_URL}/folder/create", username, password, token, json_data=payload)
+        result = await zephyr_request("POST", f"{ZAPI_BASE_URL}/folder/create", username, password, token, json_data=payload)
+        return filter_fields(result, fields)

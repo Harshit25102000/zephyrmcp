@@ -1,13 +1,13 @@
-from typing import Any, Dict, List, Optional
+﻿from typing import Any, Dict, List, Optional
 from fastmcp import FastMCP
 from fastmcp.server.context import Context
 
 
-def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload):
+def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload, filter_fields, check_tool_limit, TOOL_MAX_ITEMS, BULK_MAX_ITEMS, MAX_RESULTS):
     """Register all test case management tools and resources."""
 
     # ============================================================
-    # RESOURCES — read-only, no state change
+    # RESOURCES â€” read-only, no state change
     # ============================================================
 
     @mcp.resource("zephyr://project/{project_key}/tests")
@@ -28,7 +28,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         result = await zephyr_request(
             "GET", f"{JIRA_API_URL}/search",
             username, password, token,
-            params={"jql": f"project={project_key} AND issuetype=Test", "fields": "summary,status", "maxResults": 50}
+            params={"jql": f"project={project_key} AND issuetype=Test", "fields": "summary,status", "maxResults": MAX_RESULTS}
         )
         issues = result.get("issues", [])
         lines = [f"Tests in project {project_key} ({len(issues)} found):"]
@@ -64,7 +64,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         return "\n".join(lines)
 
     # ============================================================
-    # TOOLS — write operations
+    # TOOLS â€” write operations
     # ============================================================
 
     @mcp.tool()
@@ -73,6 +73,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         project_key: str,
         summary: str,
         description: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Create a new Jira issue of type 'Test' in the specified project.
@@ -84,8 +85,10 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         - project_key (required): Jira project key (e.g. 'QA'). Use get_projects to find valid keys.
         - summary (required): Short, descriptive title for the test case.
         - description (optional): Detailed test description including prerequisites or scope.
+        - fields (optional): List of keys to include in response (e.g. ["id", "key"]).
+          If omitted, full response is returned.
 
-        Output: { id, key, self } — use 'id' (numeric) for step operations, 'key' for status updates.
+        Output: { id, key, self } â€” use 'id' (numeric) for step operations, 'key' for status updates.
 
         Errors:
         - 400: Invalid project_key or missing required fields.
@@ -104,7 +107,8 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
             }
         }
         result = await zephyr_request("POST", f"{JIRA_API_URL}/issue", username, password, token, json_data=payload)
-        return {"id": result.get("id"), "key": result.get("key"), "self": result.get("self")}
+        response = {"id": result.get("id"), "key": result.get("key"), "self": result.get("self")}
+        return filter_fields(response, fields)
 
     @mcp.tool()
     async def create_shared_test(
@@ -112,6 +116,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         project_key: str,
         summary: str,
         description: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Create a shared/reusable Test Case (automatically prefixed with [SHARED]).
@@ -121,8 +126,9 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
 
         Input:
         - project_key (required): Jira project key.
-        - summary (required): Test summary — [SHARED] prefix is applied automatically.
+        - summary (required): Test summary â€” [SHARED] prefix is applied automatically.
         - description (optional): Detailed description.
+        - fields (optional): List of response keys to include (e.g. ["id", "key"]).
 
         Output: { id, key, self }
         """
@@ -139,7 +145,8 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
             }
         }
         result = await zephyr_request("POST", f"{JIRA_API_URL}/issue", username, password, token, json_data=payload)
-        return {"id": result.get("id"), "key": result.get("key"), "self": result.get("self")}
+        response = {"id": result.get("id"), "key": result.get("key"), "self": result.get("self")}
+        return filter_fields(response, fields)
 
     @mcp.tool()
     async def delete_test(
@@ -182,7 +189,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         Input:
         - issue_key (required): Jira issue key (e.g. 'QA-123').
         - transition_id (required): Numeric workflow transition ID.
-          Common IDs: 11=To Do, 21=In Progress, 31=Done (these vary by project — fetch from Jira if unsure).
+          Common IDs: 11=To Do, 21=In Progress, 31=Done (these vary by project â€” fetch from Jira if unsure).
 
         Output: { status: "transitioned", issue_key, transition_id }
 
@@ -203,6 +210,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         project_id: int,
         version_id: int,
         issue_ids: List[int],
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Bulk assign multiple existing test cases to a specific test cycle.
@@ -215,14 +223,18 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         - project_id (required): Numeric Jira project ID. Use get_projects to find.
         - version_id (required): Numeric Jira version ID. Use -1 for unscheduled.
         - issue_ids (required): List of numeric Jira issue IDs to add. NOT issue keys.
+          **Limit**: maximum {BULK_MAX_ITEMS} issue IDs per call. Split larger sets into batches.
+        - fields (optional): List of response keys to include.
 
         Output: Confirmation from Zephyr with job status.
 
         Errors:
         - 400: Invalid cycle_id, project_id or version_id.
         - 404: Cycle or issues not found.
+        - Tool limit: Exceeding {BULK_MAX_ITEMS} issue_ids in one call will be rejected.
         """
         check_rate_limit(ctx)
+        check_tool_limit(issue_ids, "issue_ids", limit=BULK_MAX_ITEMS)
         log_usage("tool", "add_test_cases_to_cycle", {"cycleId": cycle_id, "count": len(issue_ids)})
         username, password, token = extract_zephyr_auth(ctx)
 
@@ -233,7 +245,8 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
             "projectId": project_id,
             "method": "1",
         }
-        return await zephyr_request("POST", f"{ZAPI_BASE_URL}/execution/addTestsToCycle", username, password, token, json_data=payload)
+        result = await zephyr_request("POST", f"{ZAPI_BASE_URL}/execution/addTestsToCycle", username, password, token, json_data=payload)
+        return filter_fields(result, fields)
 
     @mcp.tool()
     async def insert_test_step(
@@ -243,6 +256,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         order_id: int,
         data: str = "",
         result: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Insert a new test step at a specific position in a Zephyr test case.
@@ -251,11 +265,12 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         Steps are ordered by order_id (1-indexed). Inserting at an existing position shifts subsequent steps.
 
         Input:
-        - issue_id (required): Numeric Jira issue ID (not key — use the number from create_test_case).
+        - issue_id (required): Numeric Jira issue ID (not key â€” use the number from create_test_case).
         - step (required): The action/instruction for this step (e.g. 'Click Login button').
         - order_id (required): Position in the step list (1 = first step).
         - data (optional): Test data or preconditions for this step.
         - result (optional): Expected outcome after performing this step.
+        - fields (optional): List of response keys to include (e.g. ["id", "orderId"]).
 
         Output: Created step object from Zephyr.
         """
@@ -264,7 +279,8 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         username, password, token = extract_zephyr_auth(ctx)
 
         payload = {"step": step, "data": data, "result": result, "orderId": order_id}
-        return await zephyr_request("POST", f"{ZAPI_BASE_URL}/teststep/{issue_id}", username, password, token, json_data=payload)
+        api_result = await zephyr_request("POST", f"{ZAPI_BASE_URL}/teststep/{issue_id}", username, password, token, json_data=payload)
+        return filter_fields(api_result, fields)
 
     @mcp.tool()
     async def update_test_step(
@@ -274,6 +290,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         step: str,
         data: str = "",
         result: str = "",
+        fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Update the content of an existing test step.
@@ -287,6 +304,7 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         - step (required): Updated action/instruction text.
         - data (optional): Updated test data.
         - result (optional): Updated expected result.
+        - fields (optional): List of response keys to include.
 
         Output: Updated step object.
         """
@@ -295,7 +313,8 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         username, password, token = extract_zephyr_auth(ctx)
 
         payload = {"step": step, "data": data, "result": result}
-        return await zephyr_request("PUT", f"{ZAPI_BASE_URL}/teststep/{issue_id}/{step_id}", username, password, token, json_data=payload)
+        api_result = await zephyr_request("PUT", f"{ZAPI_BASE_URL}/teststep/{issue_id}/{step_id}", username, password, token, json_data=payload)
+        return filter_fields(api_result, fields)
 
     @mcp.tool()
     async def delete_test_step(
@@ -323,3 +342,25 @@ def register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zep
         username, password, token = extract_zephyr_auth(ctx)
         await zephyr_request("DELETE", f"{ZAPI_BASE_URL}/teststep/{issue_id}/{step_id}", username, password, token)
         return {"status": "deleted", "step_id": step_id}
+
+    @mcp.tool()
+    async def get_test_steps(
+        ctx: Context,
+        issue_id: str,
+        fields: Optional[List[str]] = None,
+    ) -> Any:
+        """
+        Fetch all defined steps for a Zephyr test case (as structured data).
+
+        Input:
+        - issue_id (required): Numeric Jira issue ID (e.g. '10234').
+        - fields (optional): List of step keys to include per step (e.g. ["orderId", "step", "result"]).
+          Available keys: orderId, step, data, result, id, htmlStep, htmlData, htmlResult
+
+        Output: List of step objects (optionally filtered to requested fields).
+        """
+        check_rate_limit(ctx)
+        log_usage("tool", "get_test_steps", {"issueId": issue_id, "fields": fields})
+        username, password, token = extract_zephyr_auth(ctx)
+        result = await zephyr_request("GET", f"{ZAPI_BASE_URL}/teststep/{issue_id}", username, password, token)
+        return filter_fields(result, fields)

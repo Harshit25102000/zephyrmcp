@@ -16,6 +16,7 @@ from src.config import (
     JIRA_TIMEOUT, JIRA_VERIFY_SSL,
     PORT, LOG_DIR, SERVER_LOG_FILE, USAGE_LOG_FILE,
     RATE_LIMIT_COUNT, RATE_LIMIT_WINDOW_SECONDS,
+    TOOL_MAX_ITEMS, BULK_MAX_ITEMS, MAX_RESULTS,
 )
 from src.middleware.rate_limit import RateLimiter
 
@@ -62,6 +63,16 @@ This server enforces a sliding-window rate limit:
 - Do NOT retry in a tight loop. Batch your work into fewer, larger tool calls where possible.
 - Bulk tools (e.g. add_test_cases_to_cycle, bulk_execute_tests) exist precisely to reduce API calls.
 
+## Tool Usage Limits — ENFORCED
+All bulk and list tools enforce a maximum item count per call:
+- **TOOL_MAX_ITEMS = {TOOL_MAX_ITEMS}** — max items for list/query tools (e.g. get_cycles, get_executions_by_cycle).
+- **BULK_MAX_ITEMS = {BULK_MAX_ITEMS}** — higher limit for explicitly bulk write tools:
+  - `add_test_cases_to_cycle`: you may pass at most {BULK_MAX_ITEMS} issue_ids at once.
+  - `bulk_execute_tests`: you may pass at most {BULK_MAX_ITEMS} execution_ids at once.
+- If you try to exceed these limits, the server will reject the call with an actionable error.
+- **Do NOT circumvent limits by rapid repeated calls** — the rate limiter ({RATE_LIMIT_COUNT} req/{RATE_LIMIT_WINDOW_SECONDS}s) will block you.
+- MAX_RESULTS = {MAX_RESULTS} — hard cap on records returned by list tools per call.
+
 ## Error Handling
 All errors include detailed messages. Common patterns:
 - HTTP 401/403: Expired or insufficient credentials. Re-authenticate.
@@ -95,6 +106,33 @@ def log_usage(kind: str, name: str, params: dict):
     timestamp = datetime.utcnow().isoformat()
     with open(USAGE_LOG_FILE, "a") as f:
         f.write(f"{timestamp} | {kind}={name} | params={params}\n")
+
+# ============================================================
+# FIELD FILTERING
+# ============================================================
+
+def filter_fields(data: Any, fields: Optional[List[str]]) -> Any:
+    """
+    Filter an API response to only include the specified fields.
+
+    - If fields is None or empty, the full response is returned unchanged.
+    - Works on dicts (single objects) and lists of dicts.
+    - Keys not present in the response are silently ignored.
+
+    Example: filter_fields({"id": 1, "name": "A", "build": "x"}, ["id", "name"])
+             -> {"id": 1, "name": "A"}
+    """
+    if not fields:
+        return data
+    if isinstance(data, dict):
+        return {k: v for k, v in data.items() if k in fields}
+    if isinstance(data, list):
+        return [
+            {k: v for k, v in item.items() if k in fields}
+            if isinstance(item, dict) else item
+            for item in data
+        ]
+    return data
 
 # ============================================================
 # AUTH EXTRACTION
@@ -163,8 +201,34 @@ def check_rate_limit(ctx: Context):
         raise RuntimeError(
             f"Rate limit exceeded: max {RATE_LIMIT_COUNT} requests per {RATE_LIMIT_WINDOW_SECONDS} seconds. "
             f"Please wait {RATE_LIMIT_WINDOW_SECONDS} seconds before retrying. "
-            "Use bulk tools (add_test_cases_to_cycle, bulk_execute_tests) to reduce API calls."
+            "Use bulk tools (add_test_cases_to_cycle, bulk_execute_tests) to reduce API calls. "
+            f"Also, each bulk tool is capped at {BULK_MAX_ITEMS} items per call (list tools: {TOOL_MAX_ITEMS})."
         )
+
+
+def check_tool_limit(items: list, label: str = "items", limit: int = None):
+    """
+    Enforce per-tool item count limit.
+    Raises RuntimeError if len(items) exceeds `limit`.
+
+    Args:
+        items:  The list of items the caller wants to process.
+        label:  Human-readable name for the items (used in error message).
+        limit:  The maximum allowed count. Defaults to TOOL_MAX_ITEMS.
+                Pass BULK_MAX_ITEMS for dedicated bulk tools.
+
+    Call this at the start of any tool that receives a list of IDs or items.
+    """
+    effective_limit = limit if limit is not None else TOOL_MAX_ITEMS
+    if len(items) > effective_limit:
+        raise RuntimeError(
+            f"Tool usage limit exceeded: you provided {len(items)} {label}, "
+            f"but the maximum allowed per call is {effective_limit}. "
+            f"Split your request into batches of at most {effective_limit} {label} and retry. "
+            f"Note: sending many rapid batches will also trigger the rate limiter "
+            f"({RATE_LIMIT_COUNT} requests per {RATE_LIMIT_WINDOW_SECONDS}s)."
+        )
+
 
 # ============================================================
 # HTTP REQUEST UTILITY
@@ -246,9 +310,9 @@ from src.tools.tests import register_test_tools
 from src.tools.cycles import register_cycle_tools
 from src.tools.executions import register_execution_tools
 
-register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload)
-register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request)
-register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload)
+register_test_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload, filter_fields, check_tool_limit, TOOL_MAX_ITEMS, BULK_MAX_ITEMS, MAX_RESULTS)
+register_cycle_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, filter_fields, check_tool_limit, TOOL_MAX_ITEMS, BULK_MAX_ITEMS, MAX_RESULTS)
+register_execution_tools(mcp, JIRA_API_URL, ZAPI_BASE_URL, log_usage, extract_zephyr_auth, check_rate_limit, zephyr_request, zephyr_upload, filter_fields, check_tool_limit, TOOL_MAX_ITEMS, BULK_MAX_ITEMS, MAX_RESULTS)
 
 # ============================================================
 # HEALTH CHECK
@@ -277,6 +341,9 @@ async def health_check() -> dict:
         "service": "zephyr-mcp",
         "jira_base_url": JIRA_BASE_URL,
         "rate_limit": f"{RATE_LIMIT_COUNT} requests per {RATE_LIMIT_WINDOW_SECONDS}s (per user/token)",
+        "tool_max_items": TOOL_MAX_ITEMS,
+        "bulk_max_items": BULK_MAX_ITEMS,
+        "max_results_per_list": MAX_RESULTS,
         "ssl_verify": JIRA_VERIFY_SSL,
         "timeout_seconds": JIRA_TIMEOUT,
     }

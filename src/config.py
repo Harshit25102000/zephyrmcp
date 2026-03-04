@@ -8,6 +8,7 @@ import os
 # Jira / Zephyr Configuration
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL", "http://stg-jira.nomura.com")
 JIRA_TIMEOUT = int(os.getenv("JIRA_TIMEOUT", "30"))
+JIRA_VERIFY_SSL = os.getenv("JIRA_VERIFY_SSL", "False").lower() == "true"
 
 # MCP Server Configuration
 MCP_NAME = "zephyr-mcp"

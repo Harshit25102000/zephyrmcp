@@ -1,7 +1,7 @@
 import httpx
 import logging
 from typing import Optional, Dict, Any
-from src.config import JIRA_BASE_URL, JIRA_TIMEOUT
+from src.config import JIRA_BASE_URL, JIRA_TIMEOUT, JIRA_VERIFY_SSL
 
 logger = logging.getLogger("server")
 
@@ -34,7 +34,7 @@ class ZephyrBaseClient:
 
     async def _request(self, method: str, endpoint: str, params: Optional[Dict] = None, json_data: Optional[Dict] = None) -> Any:
         url = f"{self.base_url}{endpoint}"
-        async with httpx.AsyncClient(headers=self.headers, timeout=self.timeout, auth=getattr(self, 'auth', None)) as client:
+        async with httpx.AsyncClient(headers=self.headers, timeout=self.timeout, auth=getattr(self, 'auth', None), verify=JIRA_VERIFY_SSL) as client:
             try:
                 response = await client.request(method, url, params=params, json=json_data)
                 response.raise_for_status()
@@ -54,7 +54,7 @@ class ZephyrBaseClient:
         # We don't set Content-Type header manually for multipart; httpx does it with the correct boundary
         headers = {k: v for k, v in self.headers.items() if k.lower() != "content-type"}
         
-        async with httpx.AsyncClient(headers=headers, timeout=self.timeout, auth=getattr(self, 'auth', None)) as client:
+        async with httpx.AsyncClient(headers=headers, timeout=self.timeout, auth=getattr(self, 'auth', None), verify=JIRA_VERIFY_SSL) as client:
             try:
                 response = await client.post(url, params=params, files=files)
                 response.raise_for_status()

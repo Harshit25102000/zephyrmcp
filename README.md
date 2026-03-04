@@ -105,12 +105,16 @@ The server will start listening on the configured port. By default, it uses the 
 
 ## Authentication
 
-Users must provide Jira credentials via the `Authorization` header in their MCP request:
+The Zephyr MCP server supports two ways to authenticate:
 
-- **Token Auth**: `Bearer <Jira_PAT>`
-- **Basic Auth**: `Basic <Base64_Encoded_Credentials>`
+1.  **Bearer Token**:
+    - Header: `Authorization: Bearer <your_bearer_token>`
+2.  **Basic Auth (Dedicated Headers)**:
+    - Header: `username: <your_jira_username>`
+    - Header: `password: <your_jira_password_or_api_token>`
 
-The server automatically extracts these credentials to initialize the `ZephyrClient` per request.
+> [!IMPORTANT]
+> If no credentials are provided through either of these methods, the server will return an error: `Credentials not provided`.
 
 ## Logging
 
